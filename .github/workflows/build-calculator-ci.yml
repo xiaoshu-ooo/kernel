@@ -63,18 +63,74 @@ jobs:
         id: cert
         working-directory: .
         run: |
+          set +e
+
           APK="manager/app/build/outputs/apk/debug/app-debug.apk"
-          test -f "$APK"
-          CERT_OUTPUT="$(python3 scripts/apk_v2_cert.py "$APK")"
-          echo "=== apk_v2_cert.py output ==="
-          printf "%s\n" "$CERT_OUTPUT"
+
+          echo "=== APK diagnostic ==="
+          echo "PWD=$(pwd)"
+          echo "APK=$APK"
+          echo "GitHub workspace=$GITHUB_WORKSPACE"
+          echo
+
+          echo "=== manager/app/build/outputs ==="
+          find manager/app/build/outputs -maxdepth 5 -type f -print 2>&1 | sort
+          echo
+
+          if [ ! -f "$APK" ]; then
+            echo "::error::APK not found: $APK"
+            echo "=== APK candidates ==="
+            find . -type f -name '*.apk' -print 2>&1 | sort
+            exit 1
+          fi
+
+          echo "APK exists:"
+          ls -lh "$APK"
+          file "$APK"
+          echo
+
+          echo "=== Python version ==="
+          python3 --version
+          echo
+
+          echo "=== apk_v2_cert.py ==="
+          python3 scripts/apk_v2_cert.py "$APK" > /tmp/cert.out 2> /tmp/cert.err
+          PY_EXIT=$?
+
+          echo "Python exit code: $PY_EXIT"
+          echo "--- stdout ---"
+          cat /tmp/cert.out
+          echo "--- stderr ---"
+          cat /tmp/cert.err
+          echo
+
+          if [ "$PY_EXIT" -ne 0 ]; then
+            echo "::error::apk_v2_cert.py failed with exit code $PY_EXIT"
+            exit "$PY_EXIT"
+          fi
+
+          CERT_OUTPUT="$(cat /tmp/cert.out)"
+
           mapfile -t CERT <<< "$CERT_OUTPUT"
           SIZE="${CERT[0]#SIZE=}"
           HASH="${CERT[1]#SHA256=}"
-          [[ "$SIZE" =~ ^[0-9]+$ ]]
-          [[ "$HASH" =~ ^[0-9a-fA-F]{64}$ ]]
+
+          echo "Parsed SIZE=$SIZE"
+          echo "Parsed SHA256=$HASH"
+
+          if ! [[ "$SIZE" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid certificate size: $SIZE"
+            exit 1
+          fi
+
+          if ! [[ "$HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::Invalid certificate SHA256: $HASH"
+            exit 1
+          fi
+
           echo "size=$SIZE" >> "$GITHUB_OUTPUT"
           echo "hash=${HASH,,}" >> "$GITHUB_OUTPUT"
+
           printf 'Certificate size: %s bytes\nCertificate SHA-256: %s\n' "$SIZE" "${HASH,,}"
 
       - name: Preserve CI debug keystore
