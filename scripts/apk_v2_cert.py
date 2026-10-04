@@ -1,45 +1,24 @@
 #!/usr/bin/env python3
-"""Extract the first APK v2/v3 signer certificate and print size + SHA-256."""
 
 import hashlib
 import struct
 import sys
 
-
-APK_SIG_BLOCK_MAGIC = b"APK Sig Block 42"
+MAGIC = b"APK Sig Block 42"
 V2_ID = 0x7109871A
 V3_ID = 0xF05368C0
 
 
-def u32(data, offset):
-    return struct.unpack_from("<I", data, offset)[0]
+def u32(data, off):
+    return struct.unpack_from("<I", data, off)[0]
 
 
-def u64(data, offset):
-    return struct.unpack_from("<Q", data, offset)[0]
-
-
-def read_lp(data, offset, limit):
-    """Read a uint32-length-prefixed blob."""
-    if offset + 4 > limit:
-        raise RuntimeError("truncated length-prefixed field")
-
-    length = u32(data, offset)
-    start = offset + 4
-    end = start + length
-
-    if end > limit:
-        raise RuntimeError(
-            f"length-prefixed field out of range: "
-            f"start={start}, end={end}, limit={limit}"
-        )
-
-    return data[start:end], end
+def u64(data, off):
+    return struct.unpack_from("<Q", data, off)[0]
 
 
 def find_eocd(data):
-    # EOCD must be in the last 65557 bytes for a normal ZIP/APK.
-    start = max(0, len(data) - 65557)
+    start = max(0, len(data) - (65535 + 22))
     pos = data.rfind(b"PK\x05\x06", start)
 
     if pos < 0:
@@ -48,190 +27,257 @@ def find_eocd(data):
     return pos
 
 
-def find_signing_block(data, central_dir_offset):
-    """
-    APK Signing Block:
+def find_signing_block(data):
+    eocd = find_eocd(data)
 
-        uint64 size
-        ID-value pairs
-        uint64 size
-        16-byte magic
+    if eocd + 22 > len(data):
+        raise RuntimeError("truncated ZIP EOCD")
 
-    The block is immediately before the ZIP Central Directory.
-    """
+    cd_offset = u32(data, eocd + 16)
+    cd_size = u32(data, eocd + 12)
 
-    if central_dir_offset < 24:
-        raise RuntimeError("invalid central directory offset")
+    # Normal APK: signing block is immediately before central directory.
+    # The EOCD central-directory offset refers to the offset after the
+    # signing block has been removed, so first try the standard location.
+    candidates = []
 
-    footer_offset = central_dir_offset - 24
+    candidates.append(cd_offset)
 
-    # Footer:
-    #   uint64 size
-    #   16-byte magic
-    magic = data[footer_offset + 8:central_dir_offset]
+    # Also account for ZIP64/offset adjustments and search backwards
+    # around the central-directory signature.
+    sig = b"PK\x01\x02"
+    p = data.find(sig, max(0, len(data) - cd_size - 1024), len(data))
 
-    if magic != APK_SIG_BLOCK_MAGIC:
-        raise RuntimeError(
-            "APK Signing Block magic not found "
-            f"(central directory offset={central_dir_offset})"
-        )
+    if p >= 0:
+        candidates.append(p)
 
-    size = u64(data, footer_offset)
+    seen = set()
 
-    # Size excludes the first uint64 size field.
-    block_start = central_dir_offset - size - 8
+    for cd in candidates:
+        if cd in seen:
+            continue
+        seen.add(cd)
 
-    if block_start < 0:
-        raise RuntimeError("invalid APK Signing Block size")
+        if cd < 24 or cd > len(data):
+            continue
 
-    if block_start + 8 > len(data):
-        raise RuntimeError("APK Signing Block header out of range")
+        footer = cd - 24
 
-    header_size = u64(data, block_start)
+        if footer < 0:
+            continue
 
-    if header_size != size:
-        raise RuntimeError(
-            f"APK Signing Block size mismatch: "
-            f"header={header_size}, footer={size}"
-        )
+        if data[footer + 8:footer + 24] != MAGIC:
+            continue
 
-    # Confirm the footer belongs to this block.
-    if data[block_start + size - 16:block_start + size] != APK_SIG_BLOCK_MAGIC:
-        raise RuntimeError("invalid APK Signing Block magic")
+        size = u64(data, footer)
 
-    # Pairs start immediately after the first uint64 size.
-    pairs_start = block_start + 8
+        block_start = cd - size - 8
 
-    # The footer is 24 bytes.
-    pairs_end = central_dir_offset - 24
+        if block_start < 0:
+            continue
 
-    if pairs_start > pairs_end:
-        raise RuntimeError("empty APK Signing Block")
+        if block_start + 8 > len(data):
+            continue
 
-    return pairs_start, pairs_end
+        if u64(data, block_start) != size:
+            continue
+
+        if block_start + size + 8 != cd:
+            continue
+
+        if data[cd - 16:cd] != MAGIC:
+            continue
+
+        return block_start, size + 8, cd
+
+    # Last resort: locate the APK Signing Block magic and validate it.
+    # This handles APKs whose EOCD offset has been altered by ZIP tooling.
+    magic_positions = []
+    pos = 0
+
+    while True:
+        pos = data.find(MAGIC, pos)
+        if pos < 0:
+            break
+        magic_positions.append(pos)
+        pos += 1
+
+    for magic_pos in reversed(magic_positions):
+        footer = magic_pos - 8
+
+        if footer < 0:
+            continue
+
+        size = u64(data, footer)
+
+        block_start = magic_pos - size - 8
+
+        if block_start < 0:
+            continue
+
+        if block_start + 8 > len(data):
+            continue
+
+        if u64(data, block_start) != size:
+            continue
+
+        if block_start + size + 8 != magic_pos + 16:
+            continue
+
+        return block_start, size + 8, magic_pos + 16
+
+    raise RuntimeError("invalid APK Signing Block magic")
 
 
-def extract_certificate(data, pairs_start, pairs_end):
-    pos = pairs_start
+def get_signing_block(data):
+    block_start, block_total, cd = find_signing_block(data)
 
-    while pos < pairs_end:
-        if pos + 8 > pairs_end:
-            raise RuntimeError("truncated APK Signing Block pair")
+    # Signing block:
+    #
+    # uint64 size
+    # ID-value pairs
+    # uint64 size
+    # 16-byte magic
+    #
+    pair_start = block_start + 8
+    pair_end = cd - 24
 
-        pair_length = u64(data, pos)
+    if pair_end < pair_start:
+        raise RuntimeError("invalid signing block range")
+
+    pos = pair_start
+
+    while pos < pair_end:
+        if pos + 8 > pair_end:
+            raise RuntimeError("truncated signing block pair")
+
+        pair_size = u64(data, pos)
         pos += 8
 
-        if pair_length < 4:
-            raise RuntimeError("invalid APK Signing Block pair length")
+        if pair_size < 4:
+            raise RuntimeError("invalid signing block pair size")
 
-        pair_end = pos + pair_length
+        end = pos + pair_size
 
-        if pair_end > pairs_end:
-            raise RuntimeError("APK Signing Block pair out of range")
+        if end > pair_end:
+            raise RuntimeError("signing block pair exceeds block")
 
         pair_id = u32(data, pos)
         value_start = pos + 4
-        value = data[value_start:pair_end]
 
-        if pair_id not in (V2_ID, V3_ID):
-            pos = pair_end
-            continue
+        yield pair_id, data[value_start:end]
 
-        # v2/v3 value:
-        #
-        # signers = length-prefixed sequence
-        signers, _ = read_lp(value, 0, len(value))
+        pos = end
 
-        # First signer.
-        signer, _ = read_lp(signers, 0, len(signers))
 
-        # signer:
-        #   signedData
-        #   signatures
-        #   publicKey
-        signed_data, signer_pos = read_lp(
-            signer,
-            0,
-            len(signer),
+def lp(data, off, limit):
+    if off + 4 > limit:
+        raise RuntimeError("truncated length-prefixed field")
+
+    length = u32(data, off)
+    start = off + 4
+    end = start + length
+
+    if end > limit:
+        raise RuntimeError(
+            f"length-prefixed field out of range: "
+            f"start={start}, length={length}, limit={limit}"
         )
 
-        # signedData:
-        #   digests
-        #   certificates
-        #   additionalAttributes
-        digests, pos2 = read_lp(
-            signed_data,
-            0,
-            len(signed_data),
-        )
-
-        certificates, pos3 = read_lp(
-            signed_data,
-            pos2,
-            len(signed_data),
-        )
-
-        # First certificate.
-        certificate, _ = read_lp(
-            certificates,
-            0,
-            len(certificates),
-        )
-
-        if not certificate:
-            raise RuntimeError("empty APK signer certificate")
-
-        return certificate
-
-    raise RuntimeError("APK v2/v3 signer block not found")
+    return start, end
 
 
-def find_certificate(apk):
+def extract_certificate_from_signer_block(value):
+    # v2/v3 Signing Block value:
+    #
+    # signers ::= length-prefixed sequence
+    # signer ::= length-prefixed signed-data
+    #            length-prefixed signatures
+    #            length-prefixed public-key
+    #
+    signers_start, signers_end = lp(value, 0, len(value))
+
+    pos = signers_start
+
+    # Actually the first 4 bytes contain the total signers sequence.
+    # Parse the sequence itself.
+    signers_end = signers_start + (signers_end - signers_start)
+
+    if pos >= signers_end:
+        raise RuntimeError("empty signers")
+
+    signer_start, signer_end = lp(value, pos, signers_end)
+
+    signed_data_start, signed_data_end = lp(
+        value, signer_start, signer_end
+    )
+
+    signed_data = value[signed_data_start:signed_data_end]
+
+    # signed-data:
+    # digests
+    # certificates
+    # additional attributes
+    #
+    digests_start, digests_end = lp(
+        signed_data, 0, len(signed_data)
+    )
+
+    certs_start, certs_end = lp(
+        signed_data, digests_end, len(signed_data)
+    )
+
+    pos = certs_start
+
+    cert_start, cert_end = lp(
+        signed_data, pos, certs_end
+    )
+
+    cert = signed_data[cert_start:cert_end]
+
+    if not cert:
+        raise RuntimeError("empty signer certificate")
+
+    return cert
+
+
+def extract_certificate(apk):
     with open(apk, "rb") as f:
         data = f.read()
 
-    if len(data) < 22:
-        raise RuntimeError("APK is too small")
+    for pair_id, value in get_signing_block(data):
+        if pair_id not in (V2_ID, V3_ID):
+            continue
 
-    eocd = find_eocd(data)
+        cert = extract_certificate_from_signer_block(value)
 
-    # ZIP EOCD +16 = central directory offset.
-    central_dir_offset = u32(data, eocd + 16)
+        size = len(cert)
+        sha256 = hashlib.sha256(cert).hexdigest()
 
-    # This script handles normal APK ZIP layout.
-    if central_dir_offset == 0xFFFFFFFF:
-        raise RuntimeError("ZIP64 APK is not supported")
+        return size, sha256
 
-    pairs_start, pairs_end = find_signing_block(
-        data,
-        central_dir_offset,
-    )
-
-    return extract_certificate(
-        data,
-        pairs_start,
-        pairs_end,
-    )
+    raise RuntimeError("APK v2/v3 signer not found")
 
 
 def main():
     if len(sys.argv) != 2:
         print(
-            f"usage: {sys.argv[0]} APK",
+            f"Usage: {sys.argv[0]} APK",
             file=sys.stderr,
         )
         return 2
 
-    try:
-        certificate = find_certificate(sys.argv[1])
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    apk = sys.argv[1]
 
-    print(f"SIZE={len(certificate)}")
-    print(
-        f"SHA256={hashlib.sha256(certificate).hexdigest()}"
-    )
+    try:
+        size, sha256 = extract_certificate(apk)
+
+        print(size)
+        print(sha256)
+
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
     return 0
 
