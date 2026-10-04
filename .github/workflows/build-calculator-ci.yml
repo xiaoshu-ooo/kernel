@@ -65,7 +65,7 @@ jobs:
         run: |
           set +e
 
-          APK="manager/app/build/outputs/apk/debug/app-debug.apk"
+          APK="$(find manager/app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' | head -n 1)"
 
           echo "=== APK diagnostic ==="
           echo "PWD=$(pwd)"
@@ -144,7 +144,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: calculator-bootstrap-apk
-          path: manager/app/build/outputs/apk/debug/app-debug.apk
+          path: manager/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
       - name: Upload matching debug keystore
@@ -350,7 +350,7 @@ jobs:
 
       - name: Verify final package and signer
         run: |
-          APK="manager/app/build/outputs/apk/debug/app-debug.apk"
+          APK="$(find manager/app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' | head -n 1)"
           test -f "$APK"
           echo 'Package ID is configured as com.coloros.calculator; Gradle applicationId validation passed during assembleDebug.'
           CERT_OUTPUT="$(python3 scripts/apk_v2_cert.py "$APK")"
@@ -370,5 +370,5 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: KernelSU-Calculator-CI
-          path: manager/app/build/outputs/apk/debug/app-debug.apk
+          path: manager/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
