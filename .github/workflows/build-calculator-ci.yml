@@ -65,7 +65,10 @@ jobs:
         run: |
           APK="manager/app/build/outputs/apk/debug/app-debug.apk"
           test -f "$APK"
-          mapfile -t CERT < <(python3 scripts/apk_v2_cert.py "$APK")
+          CERT_OUTPUT="$(python3 scripts/apk_v2_cert.py "$APK")"
+          echo "=== apk_v2_cert.py output ==="
+          printf "%s\n" "$CERT_OUTPUT"
+          mapfile -t CERT <<< "$CERT_OUTPUT"
           SIZE="${CERT[0]#SIZE=}"
           HASH="${CERT[1]#SHA256=}"
           [[ "$SIZE" =~ ^[0-9]+$ ]]
@@ -294,7 +297,10 @@ jobs:
           APK="manager/app/build/outputs/apk/debug/app-debug.apk"
           test -f "$APK"
           echo 'Package ID is configured as com.coloros.calculator; Gradle applicationId validation passed during assembleDebug.'
-          mapfile -t CERT < <(python3 scripts/apk_v2_cert.py "$APK")
+          CERT_OUTPUT="$(python3 scripts/apk_v2_cert.py "$APK")"
+          echo "=== apk_v2_cert.py output ==="
+          printf "%s\n" "$CERT_OUTPUT"
+          mapfile -t CERT <<< "$CERT_OUTPUT"
           SIZE="${CERT[0]#SIZE=}"
           HASH="${CERT[1]#SHA256=}"
           test "$SIZE" = '${{ needs.manager-bootstrap.outputs.cert_size }}'
