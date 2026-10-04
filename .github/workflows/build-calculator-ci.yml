@@ -98,24 +98,11 @@ jobs:
   build-lkm:
     name: Build KernelSU LKM
     needs: manager-bootstrap
-    strategy:
-      fail-fast: false
-      matrix:
-        kmi:
-          - android12-5.10
-          - android13-5.10
-          - android13-5.15
-          - android14-5.15
-          - android14-6.1
-          - android15-6.6
-          - android16-6.12
-          - android17-6.18
     uses: ./.github/workflows/build-lkm.yml
     with:
       expected_size: ${{ needs.manager-bootstrap.outputs.cert_size }}
       expected_hash: ${{ needs.manager-bootstrap.outputs.cert_hash }}
       manager_package: com.coloros.calculator
-      kmi: ${{ matrix.kmi }}
     secrets: inherit
 
   build-ksuinit:
