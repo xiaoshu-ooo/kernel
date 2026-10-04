@@ -1,0 +1,11 @@
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:gravity="fill">
+        <shape android:shape="rectangle">
+            <corners android:radius="28dp" />
+            <solid android:color="#00000000" />
+        </shape>
+    </item>
+    <item android:gravity="fill">
+        <bitmap android:src="@drawable/ic_calculator_icon" android:gravity="fill" />
+    </item>
+</layer-list>

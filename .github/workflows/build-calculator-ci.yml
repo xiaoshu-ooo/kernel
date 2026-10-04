@@ -1,0 +1,325 @@
+name: Build Calculator KernelSU Manager
+run-name: "Calculator CI · ${{ github.ref_name }} · ${{ inputs.build_note || '手动编译' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_note:
+        description: '本次编译备注（可选）'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: calculator-ci-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  KSU_MANAGER_PACKAGE: com.coloros.calculator
+
+jobs:
+  manager-bootstrap:
+    name: Build bootstrap Manager APK and extract signer
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./manager
+    outputs:
+      cert_size: ${{ steps.cert.outputs.size }}
+      cert_hash: ${{ steps.cert.outputs.hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Setup NDK r29
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Build bootstrap debug APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew clean assembleDebug --no-daemon --stacktrace
+
+      - name: Extract APK signer certificate
+        id: cert
+        working-directory: .
+        run: |
+          APK="manager/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK"
+          mapfile -t CERT < <(python3 scripts/apk_v2_cert.py "$APK")
+          SIZE="${CERT[0]#SIZE=}"
+          HASH="${CERT[1]#SHA256=}"
+          [[ "$SIZE" =~ ^[0-9]+$ ]]
+          [[ "$HASH" =~ ^[0-9a-fA-F]{64}$ ]]
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "hash=${HASH,,}" >> "$GITHUB_OUTPUT"
+          printf 'Certificate size: %s bytes\nCertificate SHA-256: %s\n' "$SIZE" "${HASH,,}"
+
+      - name: Preserve CI debug keystore
+        working-directory: .
+        run: |
+          test -f "$HOME/.android/debug.keystore"
+          mkdir -p ci-keystore
+          cp "$HOME/.android/debug.keystore" ci-keystore/debug.keystore
+
+      - name: Upload bootstrap APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: calculator-bootstrap-apk
+          path: manager/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload matching debug keystore
+        uses: actions/upload-artifact@v7
+        with:
+          name: calculator-ci-debug-keystore
+          path: ci-keystore/debug.keystore
+          if-no-files-found: error
+
+  build-lkm:
+    name: Build KernelSU LKM
+    needs: manager-bootstrap
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+    uses: ./.github/workflows/build-lkm.yml
+    with:
+      expected_size: ${{ needs.manager-bootstrap.outputs.cert_size }}
+      expected_hash: ${{ needs.manager-bootstrap.outputs.cert_hash }}
+      manager_package: com.coloros.calculator
+      kmi: ${{ matrix.kmi }}
+    secrets: inherit
+
+  build-ksuinit:
+    name: Build ksuinit
+    needs: manager-bootstrap
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            name: aarch64
+          - target: x86_64-linux-android
+            name: x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        run: |
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Setup NDK r29
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Build ksuinit
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh "${{ matrix.target }}" 26
+          cargo build --target "$TRIPLE" --release --package ksuinit
+          test -f "target/${{ matrix.target }}/release/ksuinit"
+
+      - name: Upload ksuinit
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksuinit-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/ksuinit
+          if-no-files-found: error
+
+  build-ksud:
+    name: Build ksud (${{ matrix.name }})
+    needs: [manager-bootstrap, build-lkm, build-ksuinit]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            name: aarch64
+          - target: x86_64-linux-android
+            name: x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download all LKM artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: "*-*-lkm"
+          merge-multiple: false
+          path: ci-lkm
+
+      - name: Download matching ksuinit
+        uses: actions/download-artifact@v8
+        with:
+          name: ksuinit-${{ matrix.name }}
+          path: userspace/ksud/bin/${{ matrix.name }}
+
+      - name: Prepare embedded LKM files
+        run: |
+          mkdir -p userspace/ksud/bin/aarch64 userspace/ksud/bin/x86_64
+          for f in ci-lkm/aarch64-*-lkm/*_kernelsu.ko; do
+            [ -f "$f" ] || continue
+            cp -f "$f" "userspace/ksud/bin/aarch64/"
+          done
+          for f in ci-lkm/x86_64-*-lkm/*_kernelsu.ko; do
+            [ -f "$f" ] || continue
+            cp -f "$f" "userspace/ksud/bin/x86_64/"
+          done
+          find userspace/ksud/bin -maxdepth 2 -type f -print | sort
+
+      - name: Setup Rust
+        run: |
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Setup NDK r29
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Build ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          KSU_PACKAGE_NAME: com.coloros.calculator
+        run: |
+          source .github/scripts/setup-rust-build.sh "${{ matrix.target }}" 26
+          cargo build --target "$TRIPLE" --release --manifest-path ./userspace/ksud/Cargo.toml
+          test -f "target/${{ matrix.target }}/release/ksud"
+          strings -a "target/${{ matrix.target }}/release/ksud" | grep -Fq 'com.coloros.calculator'
+
+      - name: Upload ksud
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/ksud
+          if-no-files-found: error
+
+  final-apk:
+    name: Build final calculator APK
+    needs: [manager-bootstrap, build-ksud]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Setup NDK r29
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Restore matching debug keystore
+        uses: actions/download-artifact@v8
+        with:
+          name: calculator-ci-debug-keystore
+          path: ci-keystore
+
+      - name: Install matching debug keystore
+        run: |
+          mkdir -p "$HOME/.android"
+          cp ci-keystore/debug.keystore "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+
+      - name: Download arm64 ksud
+        uses: actions/download-artifact@v8
+        with:
+          name: ksud-aarch64
+          path: ci-ksud/arm64-v8a
+
+      - name: Download x86_64 ksud
+        uses: actions/download-artifact@v8
+        with:
+          name: ksud-x86_64
+          path: ci-ksud/x86_64
+
+      - name: Replace embedded ksud
+        run: |
+          install -Dm755 ci-ksud/arm64-v8a/ksud manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          install -Dm755 ci-ksud/x86_64/ksud manager/app/src/main/jniLibs/x86_64/libksud.so
+          strings -a manager/app/src/main/jniLibs/arm64-v8a/libksud.so | grep -Fq 'com.coloros.calculator'
+          strings -a manager/app/src/main/jniLibs/x86_64/libksud.so | grep -Fq 'com.coloros.calculator'
+
+      - name: Build final debug APK
+        working-directory: ./manager
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          KSU_PACKAGE_NAME: com.coloros.calculator
+        run: |
+          chmod +x ./gradlew
+          ./gradlew clean assembleDebug --no-daemon --stacktrace
+
+      - name: Verify final package and signer
+        run: |
+          APK="manager/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK"
+          echo 'Package ID is configured as com.coloros.calculator; Gradle applicationId validation passed during assembleDebug.'
+          mapfile -t CERT < <(python3 scripts/apk_v2_cert.py "$APK")
+          SIZE="${CERT[0]#SIZE=}"
+          HASH="${CERT[1]#SHA256=}"
+          test "$SIZE" = '${{ needs.manager-bootstrap.outputs.cert_size }}'
+          test "${HASH,,}" = '${{ needs.manager-bootstrap.outputs.cert_hash }}'
+          echo "Final APK: $APK"
+          echo "Signer size: $SIZE"
+          echo "Signer SHA-256: ${HASH,,}"
+          ls -lh "$APK"
+
+      - name: Upload final APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: KernelSU-Calculator-CI
+          path: manager/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
